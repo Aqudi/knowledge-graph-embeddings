@@ -8,4 +8,5 @@ class FB15k(BaseDataset):
         self.entity2id, self.relation2id = self._get_item_to_index_map(self.data)
 
     def __getitem__(self, index) -> Tuple[int, int, int]:
-        return tuple(self.data.iloc[index])
+        head, relation, tail = self.data.iloc[index]
+        return (self.entity2id[head], self.relation2id[relation], self.entity2id[tail])
