@@ -73,3 +73,28 @@ class TransE(nn.Module):
         modified_tails = torch.where(target_entity_position==0, random_entity_ids, tails)
 
         return [modified_heads, relations, modified_tails]
+
+if __name__ == "__main__":
+    from datasets.FB15k import FB15k
+    from models.transE import TransE
+    from torch.utils.data import DataLoader
+
+    data = FB15k("data/FB15k/freebase_mtr100_mte100-test.txt")
+
+    model = TransE(
+        embedding_dim=10,
+        margin=5,
+        entity2id=data.entity2id,
+        relation2id=data.relation2id,
+    )
+
+    train_dataloader = DataLoader(data, batch_size=3)
+
+    positive_triples = next(iter(train_dataloader))
+    negative_triples = TransE.create_negative_samples(positive_triples, data.entity2id)
+    
+    loss = model(positive_triples, negative_triples)
+    print(loss)
+    
+
+
