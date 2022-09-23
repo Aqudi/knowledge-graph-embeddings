@@ -75,7 +75,7 @@ class TransE(nn.Module):
         return [modified_heads, relations, modified_tails]
 
 if __name__ == "__main__":
-    from datasets.FB15k import FB15k
+    from datasets import FB15k
     from models.transE import TransE
     from torch.utils.data import DataLoader
 
