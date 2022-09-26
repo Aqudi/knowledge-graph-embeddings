@@ -1,1 +1,1 @@
-from FB15k import FB15k
+from datasets.FB15k import FB15k
