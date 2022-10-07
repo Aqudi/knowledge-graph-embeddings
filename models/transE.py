@@ -1,7 +1,8 @@
 from argparse import ArgumentParser
-from typing import Dict, Iterable, Tuple
+
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 
@@ -9,89 +10,142 @@ import pytorch_lightning as pl
 
 from utils import metrics
 
+
 class TransEDataModule(pl.LightningDataModule):
-    def __init__(self, batch_size, train_dataset, test_dataset, val_dataset):
+    def __init__(
+        self, batch_size, train_dataset=None, test_dataset=None, val_dataset=None
+    ):
         super().__init__()
-        self.save_hyperparameters(ignore=["train_dataset", "test_dataset", "val_dataset"])
+        self.save_hyperparameters(
+            ignore=["train_dataset", "test_dataset", "val_dataset"]
+        )
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
         self.val_dataset = val_dataset
 
+    def collate_fn(self, batch):
+        heads, relations, tails = [], [], []
+        for h, r, t in batch:
+            heads.append(h)
+            relations.append(r)
+            tails.append(t)
+        return (
+            torch.LongTensor(heads),
+            torch.LongTensor(relations),
+            torch.LongTensor(tails),
+        )
+
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, self.hparams.batch_size)
+        return DataLoader(
+            self.train_dataset, self.hparams.batch_size, collate_fn=self.collate_fn
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, self.hparams.batch_size)
+        return DataLoader(
+            self.test_dataset, self.hparams.batch_size, collate_fn=self.collate_fn
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, self.hparams.batch_size)
+        return DataLoader(
+            self.val_dataset, self.hparams.batch_size, collate_fn=self.collate_fn
+        )
+
 
 class TransE(pl.LightningModule):
-    def __init__(self, embedding_dim, margin, lr, norm, entity2id={}, relation2id={}, *args, **kwargs):
+    def __init__(
+        self,
+        embedding_dim=20,
+        margin=1,
+        lr=1e-5,
+        norm=1,
+        entity2id={},
+        relation2id={},
+        *args,
+        **kwargs
+    ):
         super().__init__()
 
         # parameters
-        self.embedding_dim=embedding_dim
+        self.embedding_dim = embedding_dim
         self.margin = margin
         self.lr = lr
         self.norm = norm
-        self.entity2id=entity2id
-        self.relation2id =relation2id
+        self.entity2id = entity2id
+        self.relation2id = relation2id
 
         # training setup
         self.criterior = nn.MarginRankingLoss(margin=margin)
-        
+
         # layers
-        self.relation_embedding = nn.Embedding(num_embeddings=len(self.relation2id), embedding_dim=embedding_dim, padding_idx=0)
-        self.entity_embedding = nn.Embedding(num_embeddings=len(self.entity2id),embedding_dim=embedding_dim, padding_idx=0)
+        self.relation_embedding = nn.Embedding(
+            num_embeddings=len(self.relation2id),
+            embedding_dim=embedding_dim,
+            padding_idx=0,
+        )
+        self.entity_embedding = nn.Embedding(
+            num_embeddings=len(self.entity2id),
+            embedding_dim=embedding_dim,
+            padding_idx=0,
+        )
 
         # initialize embeddings
         initializer_factor = np.divide(6, np.sqrt(embedding_dim))
-        self.entity_embedding.weight.data.uniform_(-initializer_factor, initializer_factor)
-        self.relation_embedding.weight.data.uniform_(-initializer_factor, initializer_factor)
+        self.entity_embedding.weight.data.uniform_(
+            -initializer_factor, initializer_factor
+        )
+        self.relation_embedding.weight.data.uniform_(
+            -initializer_factor, initializer_factor
+        )
 
         # normalize rel_embedding
-        self.relation_embedding.weight.data /= len(self.relation2id)
+        self.relation_embedding.weight.data = F.normalize(
+            self.relation_embedding.weight.data
+        )
 
     @staticmethod
     def add_model_specific_args(parent_parser: ArgumentParser):
         parser = parent_parser.add_argument_group("TransE")
-        parser.add_argument("--embedding_dim", default=20)
-        parser.add_argument("--lr", default=0.001)
-        parser.add_argument("--margin", default=1)
-        parser.add_argument("--norm", default=1)
+        parser.add_argument("--embedding_dim", type=int, default=20)
+        parser.add_argument("--lr", type=float, default=1e-5)
+        parser.add_argument("--margin", type=float, default=1)
+        parser.add_argument("--norm", type=int, default=1)
 
     def forward(self, x):
         """Inference only"""
         return self._distance(x)
 
-    def training_step(self, batch: Iterable[Tuple[int, int, int]], _):
+    def _step(self, batch, _):
+        negative_triples = self.create_negative_samples(batch, self.entity2id)
+
+        positive_distance = self.forward(batch)
+        negative_distance = self.forward(negative_triples)
+
+        target = torch.tensor([1], dtype=torch.long, device=self.device)
+
+        return positive_distance, negative_distance, target
+
+    def training_step(self, batch, _):
         """Training"""
-        negative_triples = self.create_negative_samples(batch, self.entity2id)
-
-        positive_distance = self.forward(batch)
-        negative_distance = self.forward(negative_triples)
-        target = torch.tensor([-1], device=self.device)
-
+        self.normalize_entity_embedding()
+        positive_distance, negative_distance, target = self._step(batch, _)
         loss = self.criterior(positive_distance, negative_distance, target)
-        return loss
+        tensorboard_logs = {"train_loss": loss}
+        return {"loss": loss, "log": tensorboard_logs}
 
-    def validation_step(self, batch:Iterable[Tuple[int, int, int]], _):
+    def validation_step(self, batch, _):
         """Validation"""
-        negative_triples = self.create_negative_samples(batch, self.entity2id)
-
-        positive_distance = self.forward(batch)
-        negative_distance = self.forward(negative_triples)
-        target = torch.tensor([-1], device=self.device)
-
+        positive_distance, negative_distance, target = self._step(batch, _)
         loss = self.criterior(positive_distance, negative_distance, target)
 
         """Validation hit@k, mrr"""
         head, relation, tail = batch
         batch_size = len(head)
 
-        entity_ids = torch.arange(end=len(self.entity2id), device=self.device).repeat(batch_size, 1)
+        entity_ids = torch.arange(
+            end=len(self.entity2id),
+            device=self.device,
+        ).repeat(batch_size, 1)
         num_possible_triples = entity_ids.size()[1]
 
         # adjust shape
@@ -110,23 +164,24 @@ class TransE(pl.LightningModule):
         predictions = torch.cat((tail_predictions, head_predictions), dim=0)
         ground_truth_idxes = torch.cat((tail.reshape(-1, 1), head.reshape(-1, 1)))
 
-        hit_at_1 = metrics.hit_at_k(predictions, ground_truth_idxes, device=self.device, k=1)
-        hit_at_3 = metrics.hit_at_k(predictions, ground_truth_idxes, device=self.device, k=3)
-        hit_at_5 = metrics.hit_at_k(predictions, ground_truth_idxes, device=self.device, k=5)
-        hit_at_10 = metrics.hit_at_k(predictions, ground_truth_idxes, device=self.device, k=10)
-        hit_at_20 = metrics.hit_at_k(predictions, ground_truth_idxes, device=self.device, k=20)
+        ks = [1, 3, 5, 10, 20]
+        hit_at_k = [
+            metrics.hit_at_k(predictions, ground_truth_idxes, device=self.device, k=k)
+            for k in ks
+        ]
+
         mrr = metrics.mrr(predictions, ground_truth_idxes)
 
-        result= dict(
+        result = dict(
             val_loss=loss,
-            hit_at_1=hit_at_1,
-            hit_at_3=hit_at_3,
-            hit_at_5=hit_at_5,
-            hit_at_10=hit_at_10,
-            hit_at_20=hit_at_20,
+            hit_at_1=hit_at_k[0],
+            hit_at_3=hit_at_k[1],
+            hit_at_5=hit_at_k[2],
+            hit_at_10=hit_at_k[3],
+            hit_at_20=hit_at_k[4],
             mrr=mrr,
-        ) 
-        self.log_dict(result)
+        )
+        self.log_dict(result, prog_bar=True)
         return result
 
     def configure_optimizers(self):
@@ -137,36 +192,50 @@ class TransE(pl.LightningModule):
     ########################
 
     def normalize_entity_embedding(self):
-        self.entity_embedding.weight.data /= len(self.entity2id)
+        self.entity_embedding.weight.data = F.normalize(
+            self.entity_embedding.weight.data
+        )
 
-    def _distance(self, triples:Iterable[Tuple[int, int, int]]):
+    def _distance(self, triples):
         head, relation, tail = triples
-        
+
         # embedding layer
         head_embedding = self.entity_embedding(head)
         relation_embedding = self.relation_embedding(relation)
         tail_embedding = self.entity_embedding(tail)
-        
+
         # calculate norm
-        result = (head_embedding+relation_embedding) - tail_embedding
+        result = (head_embedding + relation_embedding) - tail_embedding
         norm = result.norm(p=self.norm, dim=1)
         return norm
 
-    def create_negative_samples(self, triples:Iterable[Tuple[int, int, int]], entity2id:Dict[str, int]):
-        size = (len(triples[0]),)
+    def create_negative_samples(self, triples, entity2id):
+        heads, relations, tails = triples
+        size = (1, len(heads))
 
         # Negative sample을 만들 때 head를 바꿀지 tail을 바꿀지 선택
         target_entity_position = torch.randint(high=2, size=size, device=self.device)
+        target_entity_position = target_entity_position.squeeze()
 
         # 바꿀 random entity indices 생성
-        random_entity_ids = torch.randint(low=0, high=len(entity2id), size=size, device=self.device)
+        random_entity_ids = torch.randint(
+            low=0, high=len(entity2id), size=size, device=self.device
+        )
+        random_entity_ids = random_entity_ids.squeeze()
 
         # Random entity로 교체
-        heads, relations, tails =triples
-        modified_heads = torch.where(target_entity_position==1, random_entity_ids, heads)
-        modified_tails = torch.where(target_entity_position==0, random_entity_ids, tails)
+        modified_heads = torch.where(
+            target_entity_position == 1, random_entity_ids, heads
+        )
+        modified_tails = torch.where(
+            target_entity_position == 0, random_entity_ids, tails
+        )
 
-        return [modified_heads, relations, modified_tails]
+        return (
+            modified_heads,
+            relations,
+            modified_tails,
+        )
 
 
 if __name__ == "__main__":
@@ -174,22 +243,41 @@ if __name__ == "__main__":
     from models.transE import TransE
     from torch.utils.data import DataLoader
 
-    data = FB15k("data/FB15k/freebase_mtr100_mte100-test.txt")
+    # Dataset & Dataloader
+    entity2id, relation2id = {}, {}
+    train_dataset = FB15k(
+        "./data/FB15k/freebase_mtr100_mte100-train.txt",
+        entity2id=entity2id,
+        relation2id=relation2id,
+    )
+    test_dataset = FB15k(
+        "./data/FB15k/freebase_mtr100_mte100-test.txt",
+        entity2id=entity2id,
+        relation2id=relation2id,
+    )
+    val_dataset = FB15k(
+        "./data/FB15k/freebase_mtr100_mte100-valid.txt",
+        entity2id=entity2id,
+        relation2id=relation2id,
+    )
 
+    datamodule = TransEDataModule(
+        10,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        val_dataset=val_dataset,
+    )
+
+    # Model
     model = TransE(
         embedding_dim=10,
         margin=5,
-        entity2id=data.entity2id,
-        relation2id=data.relation2id,
+        entity2id=entity2id,
+        relation2id=relation2id,
     )
 
-    train_dataloader = DataLoader(data, batch_size=3)
+    positive_triples = next(iter(datamodule.train_dataloader()))
+    negative_triples = model.create_negative_samples(positive_triples, entity2id)
 
-    positive_triples = next(iter(train_dataloader))
-    negative_triples = TransE.create_negative_samples(positive_triples, data.entity2id)
-    
-    loss = model(positive_triples, negative_triples)
+    loss = model(positive_triples)
     print(loss)
-    
-
-
